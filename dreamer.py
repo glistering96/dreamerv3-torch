@@ -94,14 +94,46 @@ class Dreamer(nn.Module):
         if self._config.eval_state_mean:
             latent["stoch"] = latent["mean"]
         feat = self._wm.dynamics.get_feat(latent)
+        
+        # Get mask for action masking (if available)
+        mask = obs.get("mask", None)
+        coords = obs.get("coords", None)
+        
+        # Prepare kwargs for actor
+        actor_kwargs = {"mask": mask}
+        
+        # Check if actor is TSPPointerActor and needs coords
+        if hasattr(self._task_behavior.actor, "_num_actions"): # Simple check, or check class name
+             # We can just pass coords if they exist, standard MLP actor will ignore unexpected kwargs? 
+             # No, MLP.forward definition: def forward(self, features, mask=None, dtype=None):
+             # It does NOT accept **kwargs. So we must be careful.
+             pass
+        
+        # Actually, let's look at models.py. MLP.forward signature:
+        # def forward(self, features, mask=None, dtype=None):
+        # TSPPointerActor.forward signature:
+        # def forward(self, features, coords, mask=None):
+        
+        # We need to distinguish or modify MLP to accept **kwargs (safer).
+        # Or check instance type.
+        # But importing networks here might be circular or annoying.
+        # Let's try-except or check using type name string.
+        
+        is_pointer = self._config.actor.get("type", "mlp") == "tsp_pointer"
+        
+        if is_pointer and coords is not None:
+            if len(coords.shape) == 2: # (B, N*2) flattened
+                coords = coords.reshape(coords.shape[0], -1, 2)
+            actor_kwargs["coords"] = coords
+
         if not training:
-            actor = self._task_behavior.actor(feat)
+            actor = self._task_behavior.actor(feat, **actor_kwargs)
             action = actor.mode()
         elif self._should_expl(self._step):
-            actor = self._expl_behavior.actor(feat)
+            actor = self._expl_behavior.actor(feat, **actor_kwargs)
             action = actor.sample()
         else:
-            actor = self._task_behavior.actor(feat)
+            actor = self._task_behavior.actor(feat, **actor_kwargs)
             action = actor.sample()
         logprob = actor.log_prob(action)
         latent = {k: v.detach() for k, v in latent.items()}
@@ -118,7 +150,19 @@ class Dreamer(nn.Module):
         metrics = {}
         post, context, mets = self._wm._train(data)
         metrics.update(mets)
+        metrics.update(mets)
         start = post
+        # Inject coords for TSPPointerActor
+        if 'coords' in data:
+             start['coords'] = torch.tensor(data['coords'], device=self._config.device, dtype=torch.float32)
+        
+        if 'mask' in data:
+             start['mask'] = torch.tensor(data['mask'], device=self._config.device, dtype=torch.bool)
+        
+        # Inject current_pos for reward simulation
+        if 'current_pos' in data:
+             start['current_pos'] = torch.tensor(data['current_pos'], device=self._config.device, dtype=torch.float32)
+             
         reward = lambda f, s, a: self._wm.heads["reward"](
             self._wm.dynamics.get_feat(s)
         ).mode()
@@ -183,6 +227,13 @@ def make_env(config, mode, id):
 
         env = MemoryMaze(task, seed=config.seed + id)
         env = wrappers.OneHotAction(env)
+
+    elif suite == "gym":
+        from envs.gym import Gym
+
+        env = Gym(task)
+        env = wrappers.OneHotAction(env)
+    
     elif suite == "crafter":
         import envs.crafter as crafter
 
@@ -192,6 +243,16 @@ def make_env(config, mode, id):
         import envs.minecraft as minecraft
 
         env = minecraft.make_env(task, size=config.size, break_speed=config.break_speed)
+        env = wrappers.OneHotAction(env)
+    elif suite == "tsp":
+        from envs.routing import TSPEnv
+
+        env = TSPEnv(num_nodes=int(task), seed=config.seed + id)
+        env = wrappers.OneHotAction(env)
+    elif suite == "cvrp":
+        from envs.routing import CVRPEnv
+
+        env = CVRPEnv(num_nodes=int(task), seed=config.seed + id)
         env = wrappers.OneHotAction(env)
     else:
         raise NotImplementedError(suite)

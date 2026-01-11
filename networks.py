@@ -304,6 +304,8 @@ class MultiEncoder(nn.Module):
         mlp_layers,
         mlp_units,
         symlog_inputs,
+        attn_type=None,
+        attn_num_nodes=20,
     ):
         super(MultiEncoder, self).__init__()
         excluded = ("is_first", "is_last", "is_terminal", "reward")
@@ -315,13 +317,27 @@ class MultiEncoder(nn.Module):
         self.cnn_shapes = {
             k: v for k, v in shapes.items() if len(v) == 3 and re.match(cnn_keys, k)
         }
-        self.mlp_shapes = {
-            k: v
-            for k, v in shapes.items()
-            if len(v) in (1, 2) and re.match(mlp_keys, k)
-        }
+        
+        # If attention is used, coords should be handled by attention encoder
+        self.attn_type = attn_type
+        if attn_type == "attention":
+            self.mlp_shapes = {
+                k: v
+                for k, v in shapes.items()
+                if len(v) in (1, 2) and re.match(mlp_keys, k) and k != "coords"
+            }
+            self.coords_shape = shapes.get("coords")
+        else:
+            self.mlp_shapes = {
+                k: v
+                for k, v in shapes.items()
+                if len(v) in (1, 2) and re.match(mlp_keys, k)
+            }
+
         print("Encoder CNN shapes:", self.cnn_shapes)
         print("Encoder MLP shapes:", self.mlp_shapes)
+        if attn_type == "attention":
+            print(f"Encoder Attention shapes: {{'coords': {self.coords_shape}}}")
 
         self.outdim = 0
         if self.cnn_shapes:
@@ -331,8 +347,16 @@ class MultiEncoder(nn.Module):
                 input_shape, cnn_depth, act, norm, kernel_size, minres
             )
             self.outdim += self._cnn.outdim
+        
+        if attn_type == "attention":
+            self._attn = TSPAttentionEncoder(
+                num_nodes=attn_num_nodes,
+                embed_dim=mlp_units,
+            )
+            self.outdim += self._attn.outdim
+
         if self.mlp_shapes:
-            input_size = sum([sum(v) for v in self.mlp_shapes.values()])
+            input_size = sum([sum(v) if isinstance(v, tuple) else v for v in self.mlp_shapes.values()])
             self._mlp = MLP(
                 input_size,
                 None,
@@ -350,6 +374,8 @@ class MultiEncoder(nn.Module):
         if self.cnn_shapes:
             inputs = torch.cat([obs[k] for k in self.cnn_shapes], -1)
             outputs.append(self._cnn(inputs))
+        if self.attn_type == "attention":
+            outputs.append(self._attn(obs["coords"]))
         if self.mlp_shapes:
             inputs = torch.cat([obs[k] for k in self.mlp_shapes], -1)
             outputs.append(self._mlp(inputs))
@@ -654,7 +680,7 @@ class MLP(nn.Module):
                 self.std_layer = nn.Linear(units, np.prod(self._shape))
                 self.std_layer.apply(tools.uniform_weight_init(outscale))
 
-    def forward(self, features, dtype=None):
+    def forward(self, features, mask=None, dtype=None, **kwargs):
         x = features
         if self._symlog_inputs:
             x = tools.symlog(x)
@@ -670,7 +696,7 @@ class MLP(nn.Module):
                     std = self.std_layer[name](out)
                 else:
                     std = self._std
-                dists.update({name: self.dist(self._dist, mean, std, shape)})
+                dists.update({name: self.dist(self._dist, mean, std, shape, mask=mask)})
             return dists
         else:
             mean = self.mean_layer(out)
@@ -678,9 +704,9 @@ class MLP(nn.Module):
                 std = self.std_layer(out)
             else:
                 std = self._std
-            return self.dist(self._dist, mean, std, self._shape)
+            return self.dist(self._dist, mean, std, self._shape, mask=mask)
 
-    def dist(self, dist, mean, std, shape):
+    def dist(self, dist, mean, std, shape, mask=None):
         if dist == "tanh_normal":
             mean = torch.tanh(mean)
             std = F.softplus(std) + self._min_std
@@ -711,7 +737,16 @@ class MLP(nn.Module):
                 torchd.independent.Independent(dist, 1), absmax=self._absmax
             )
         elif dist == "onehot":
-            dist = tools.OneHotDist(mean, unimix_ratio=self._unimix_ratio)
+            # Apply action masking: invalid actions get -inf logits
+            if mask is not None:
+                mask = mask.to(mean.device)
+                if mask.dtype != torch.bool:
+                    mask = mask.bool()
+                # Safety: if all actions masked, don't apply mask (avoid NaN)
+                any_valid = mask.any(dim=-1, keepdim=True)
+                safe_mask = torch.where(any_valid, mask, torch.ones_like(mask))
+                mean = mean.masked_fill(~safe_mask, float('-inf'))
+            dist = tools.OneHotDist(mean, unimix_ratio=self._unimix_ratio, mask=mask)
         elif dist == "onehot_gumble":
             dist = tools.ContDist(
                 torchd.gumbel.Gumbel(mean, 1 / self._temp), absmax=self._absmax
@@ -808,3 +843,227 @@ class ImgChLayerNorm(nn.Module):
         x = self.norm(x)
         x = x.permute(0, 3, 1, 2)
         return x
+
+
+class TSPAttentionEncoder(nn.Module):
+    """
+    POMO-style Transformer encoder for TSP/CVRP.
+    Processes node coordinates with self-attention for node-count generalization.
+    
+    Input: coords (batch, time, num_nodes * 2) flattened
+    Output: (batch, time, embed_dim) graph-level embedding
+    """
+    def __init__(
+        self,
+        num_nodes,
+        coord_dim=2,
+        embed_dim=128,
+        num_heads=4,
+        num_layers=2,
+        ff_dim=256,
+    ):
+        super(TSPAttentionEncoder, self).__init__()
+        self.num_nodes = num_nodes
+        self.coord_dim = coord_dim
+        self.embed_dim = embed_dim
+        self.outdim = embed_dim * num_nodes
+        
+        # Initial linear projection: coord_dim -> embed_dim
+        self.input_proj = nn.Linear(coord_dim, embed_dim)
+        
+        # Transformer encoder layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            batch_first=True,
+            dropout=0.0,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Layer norm
+        self.norm = nn.LayerNorm(embed_dim)
+    
+    def forward(self, coords_flat, mask=None):
+        """
+        Args:
+            coords_flat: (batch, time, num_nodes * 2) or (batch, num_nodes * 2)
+            mask: optional (batch, time, num_nodes) or (batch, num_nodes)
+        Returns:
+            (batch, time, embed_dim) or (batch, embed_dim)
+        """
+        orig_shape = coords_flat.shape
+        has_time = len(orig_shape) == 3
+        
+        if has_time:
+            batch, time, _ = orig_shape
+            # Reshape: (batch * time, num_nodes, 2)
+            coords = coords_flat.reshape(batch * time, -1, self.coord_dim)
+        else:
+            batch = orig_shape[0]
+            coords = coords_flat.reshape(batch, -1, self.coord_dim)
+        
+        # Project to embed_dim: (B, N, embed_dim)
+        x = self.input_proj(coords)
+        
+        # Transformer: (B, N, embed_dim) -> (B, N, embed_dim)
+        x = self.transformer(x)
+        x = self.norm(x)
+        
+        # Flatten nodes: (B, N * embed_dim)
+        x = x.flatten(start_dim=1)
+        
+        if has_time:
+            # Reshape back: (batch, time, N * embed_dim)
+            x = x.reshape(batch, time, -1)
+        
+        return x
+
+
+class MaskedActor(nn.Module):
+    """
+    Actor network with action masking support for discrete actions.
+    Invalid actions get -inf logits before softmax.
+    """
+    def __init__(
+        self,
+        inp_dim,
+        num_actions,
+        layers=2,
+        units=512,
+        act="SiLU",
+        norm=True,
+        unimix_ratio=0.01,
+        outscale=1.0,
+    ):
+        super(MaskedActor, self).__init__()
+        self._num_actions = num_actions
+        self._unimix_ratio = unimix_ratio
+        act = getattr(torch.nn, act)
+        
+        # MLP layers
+        self.layers = nn.Sequential()
+        for i in range(layers):
+            self.layers.add_module(
+                f"Actor_linear{i}", nn.Linear(inp_dim, units, bias=False)
+            )
+            if norm:
+                self.layers.add_module(
+                    f"Actor_norm{i}", nn.LayerNorm(units, eps=1e-03)
+                )
+            self.layers.add_module(f"Actor_act{i}", act())
+            if i == 0:
+                inp_dim = units
+        self.layers.apply(tools.weight_init)
+        
+        # Output logits layer
+        self.logits_layer = nn.Linear(units, num_actions)
+        self.logits_layer.apply(tools.uniform_weight_init(outscale))
+    
+    def forward(self, features, mask=None):
+        """
+        Args:
+            features: (batch, ..., feat_dim)
+            mask: (batch, ..., num_actions) boolean, True = valid action
+        Returns:
+            OneHotDist with masked logits
+        """
+        x = self.layers(features)
+        logits = self.logits_layer(x)
+        
+        # Apply mask: invalid actions -> -inf
+        if mask is not None:
+            # Ensure mask matches logits shape
+            mask = mask.to(logits.device)
+            if mask.dtype != torch.bool:
+                mask = mask.bool()
+            logits = logits.masked_fill(~mask, float('-inf'))
+        
+
+        return tools.OneHotDist(logits, unimix_ratio=self._unimix_ratio)
+
+
+class TSPPointerActor(nn.Module):
+    """
+    Pointer-Network style Actor for TSP.
+    Attends to static graph node embeddings using the dynamic RSSM state as query.
+    """
+    def __init__(
+        self,
+        inp_dim,        # RSSM feature size
+        num_actions,    # Num nodes
+        embed_dim=128,
+        num_heads=4,
+        act="SiLU",
+        norm=True,
+        unimix_ratio=0.01,
+        outscale=1.0,
+    ):
+        super(TSPPointerActor, self).__init__()
+        self._num_actions = num_actions
+        self._unimix_ratio = unimix_ratio
+        
+        # 1. Project RSSM state to Query
+        self.query_proj = nn.Linear(inp_dim, embed_dim)
+        
+        # 2. Embed Node Coordinates to Keys/Values
+        # Simple linear projection for 2D coords -> Embed
+        self.coord_proj = nn.Linear(2, embed_dim)
+        
+        # 3. Multi-Head Attention
+        # Note: We want logits, so we might just use Dot-Product Attention
+        # But standard Transformer uses MHA. 
+        # For Pointer Net, we typically want the attention weights themselves as logits.
+        # Let's use a simplified Single-Head Attention or projected Query/Key.
+        # To match standard MHA power, let's use a small Transformer Decoder-like block
+        # But for strictly selecting a node, a simple `u_i = v^T tanh(W_ref r_i + W_q q)` is used in ptr-net.
+        # Modern approach: Scaled Dot Product Attention.
+        
+        self.scale = 1 / (embed_dim ** 0.5)
+        self.W_q = nn.Linear(embed_dim, embed_dim)
+        self.W_k = nn.Linear(embed_dim, embed_dim)
+        
+    def forward(self, features, coords, mask=None, current_pos=None):
+        """
+        Args:
+            features: (batch, feat_dim) - RSSM state
+            coords: (batch, num_nodes, 2) - Static graph
+            mask: (batch, num_nodes) - Valid actions
+            current_pos: (batch, 2) - Explicit current location (x, y)
+        """
+        # Ensure coords are present
+        if coords is None:
+            raise ValueError("TSPPointerActor requires 'coords' input")
+            
+        # 1. Prepare Query (RSSM State + optional explicit current_pos)
+        # (..., F) -> (..., 1, E)
+        query = self.query_proj(features).unsqueeze(-2)
+        
+        if current_pos is not None:
+             # Project current_pos and add to query embedding
+             # We assume self.coord_proj exists (defined for coords)
+             # Let's ensure query_proj and coord_proj are compatible.
+             q_pos = self.coord_proj(current_pos).unsqueeze(-2)
+             query = query + q_pos
+
+        query = self.W_q(query)
+        
+        # 2. Prepare Keys (Node Coordinates)
+        # (..., N, 2) -> (..., N, E)
+        keys = self.coord_proj(coords)
+        keys = self.W_k(keys)
+        
+        # 3. Attention Scores (Logits)
+        # (..., 1, E) @ (..., E, N) -> (..., 1, N)
+        logits = torch.matmul(query, keys.transpose(-2, -1)) * self.scale
+        logits = logits.squeeze(-2) # (..., N)
+        
+        # 4. Apply Mask
+        if mask is not None:
+             # Ensure mask matches logits shape
+            mask = mask.to(logits.device)
+            if mask.dtype != torch.bool:
+                mask = mask.bool()
+            logits = logits.masked_fill(~mask, float('-inf'))
+        
+        return tools.OneHotDist(logits, unimix_ratio=self._unimix_ratio)

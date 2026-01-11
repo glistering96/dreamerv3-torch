@@ -55,7 +55,7 @@ class TimeRecording:
 
 
 class Logger:
-    def __init__(self, logdir, step):
+    def __init__(self, logdir, step, use_mlflow=True):
         self._logdir = logdir
         self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
         self._last_step = None
@@ -64,6 +64,18 @@ class Logger:
         self._images = {}
         self._videos = {}
         self.step = step
+        
+        # MLflow integration
+        self._use_mlflow = use_mlflow
+        if use_mlflow:
+            try:
+                import mlflow
+                mlflow.set_experiment(logdir.name if hasattr(logdir, 'name') else str(logdir))
+                mlflow.start_run(run_name=logdir.name if hasattr(logdir, 'name') else None)
+                self._mlflow = mlflow
+            except ImportError:
+                print("MLflow not installed, skipping MLflow logging")
+                self._use_mlflow = False
 
     def scalar(self, name, value):
         self._scalars[name] = float(value)
@@ -88,6 +100,12 @@ class Logger:
                 self._writer.add_scalar("scalars/" + name, value, step)
             else:
                 self._writer.add_scalar(name, value, step)
+            # MLflow logging
+            if self._use_mlflow:
+                try:
+                    self._mlflow.log_metric(name.replace("/", "_"), value, step=step)
+                except Exception:
+                    pass
         for name, value in self._images.items():
             self._writer.add_image(name, value, step)
         for name, value in self._videos.items():
@@ -102,6 +120,7 @@ class Logger:
         self._scalars = {}
         self._images = {}
         self._videos = {}
+
 
     def _compute_fps(self, step):
         if self._last_step is None:
@@ -205,7 +224,12 @@ def simulate(
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
                 length = len(cache[envs[i].id]["reward"]) - 1
                 score = float(np.array(cache[envs[i].id]["reward"]).sum())
-                video = cache[envs[i].id]["image"]
+
+                if 'image' in cache[envs[i].id]:
+                    video = cache[envs[i].id]["image"]
+                else:
+                    video = np.array([])
+                
                 # record logs given from environments
                 for key in list(cache[envs[i].id].keys()):
                     if "log_" in key:
@@ -233,7 +257,9 @@ def simulate(
 
                     score = sum(eval_scores) / len(eval_scores)
                     length = sum(eval_lengths) / len(eval_lengths)
-                    logger.video(f"eval_policy", np.array(video)[None])
+
+                    if video.size:
+                        logger.video(f"eval_policy", np.array(video)[None])
 
                     if len(eval_scores) >= episodes and not eval_done:
                         logger.scalar(f"eval_return", score)
@@ -423,12 +449,42 @@ class SampleDist:
 
 
 class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
-    def __init__(self, logits=None, probs=None, unimix_ratio=0.0):
+    def __init__(self, logits=None, probs=None, unimix_ratio=0.0, mask=None):
         if logits is not None and unimix_ratio > 0.0:
             probs = F.softmax(logits, dim=-1)
+            
+            # Handle potential NaNs from softmax (e.g., all logits -inf)
+            if torch.isnan(probs).any():
+                probs = torch.nan_to_num(probs, nan=1.0/probs.shape[-1])
+                
             probs = probs * (1.0 - unimix_ratio) + unimix_ratio / probs.shape[-1]
-            logits = torch.log(probs)
-            super().__init__(logits=logits, probs=None)
+            if mask is not None:
+                probs = probs * mask.float()
+                probs_sum = probs.sum(dim=-1, keepdim=True)
+                
+                # Should not happen with softmax, but if 0, fallback
+                safe_sum = torch.where(probs_sum > 0, probs_sum, torch.ones_like(probs_sum))
+                probs = probs / safe_sum
+                
+                # If everything was masked (sum=0) or mask caused 0, we need a fallback.
+                if (probs_sum == 0).any():
+                    # Check if mask itself has any valid actions
+                    mask_float = mask.float()
+                    mask_sum = mask_float.sum(dim=-1, keepdim=True)
+                    # If mask has valids: uniform on mask. If mask empty: uniform on all.
+                    fallback_mask = torch.where(mask_sum > 0, mask_float, torch.ones_like(mask_float))
+                    fallback = fallback_mask / fallback_mask.sum(dim=-1, keepdim=True)
+                    
+                    probs = torch.where(probs_sum > 0, probs, fallback)
+            
+            # Ensure proper normalization one last time for numerical stability
+            # probs = probs / probs.sum(dim=-1, keepdim=True)
+            # super().__init__(probs=probs, validate_args=False)
+            
+            # SAFE MODE: Convert to logits to bypass strict Simplex check on probs
+            # Add epsilon to avoid log(0)
+            logits_safe = torch.log(probs + 1e-10)
+            super().__init__(logits=logits_safe, validate_args=False)
         else:
             super().__init__(logits=logits, probs=probs)
 
