@@ -980,7 +980,7 @@ class MaskedActor(nn.Module):
             logits = logits.masked_fill(~mask, float('-inf'))
         
 
-        return tools.OneHotDist(logits, unimix_ratio=self._unimix_ratio)
+        return tools.OneHotDist(logits, unimix_ratio=self._unimix_ratio, mask=mask)
 
 
 class TSPPointerActor(nn.Module):
@@ -1066,4 +1066,4 @@ class TSPPointerActor(nn.Module):
                 mask = mask.bool()
             logits = logits.masked_fill(~mask, float('-inf'))
         
-        return tools.OneHotDist(logits, unimix_ratio=self._unimix_ratio)
+        return tools.OneHotDist(logits, unimix_ratio=self._unimix_ratio, mask=mask)
