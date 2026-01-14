@@ -504,6 +504,12 @@ class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
         sample += probs - probs.detach()
         return sample
 
+    def log_prob(self, value):
+        # Override to add numerical stability - clamp to prevent -inf
+        # This prevents NaN gradients when policy becomes too deterministic
+        logprob = super().log_prob(value)
+        return torch.clamp(logprob, min=-20.0)
+
 
 class DiscDist:
     def __init__(

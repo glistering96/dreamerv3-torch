@@ -364,6 +364,143 @@ return tools.OneHotDist(logits, unimix_ratio=self._unimix_ratio, mask=mask)
 
 `OneHotDist`에 이미 `mask` 파라미터가 있고, unimix 후 재적용 로직도 있음!
 
+### 검증: 영향받는 Actor들
+
+| Actor | mask를 OneHotDist에 전달? | 수정 필요? |
+|-------|-------------------------|-----------|
+| **TSPPointerActor** (Line 1069) | ❌ | 🔴 수정 필요 |
+| **MaskedActor** (Line 983) | ❌ | 🔴 수정 필요 |
+| MLP.dist() (Line 749) | ✅ | ✅ 정상 |
+
+**현재 실험**: `actor.type: tsp_pointer` → **TSPPointerActor 사용 중**
+
 ---
 
 *Last updated: 2026-01-11*
+
+## 13. 🔴 Actor Gradient NaN Collapse (2026-01-13)
+
+### 현상: Step 42,252에서 학습 붕괴
+
+| Step | actor_grad_norm | actor_entropy | train_return |
+|------|----------------|---------------|--------------|
+| 10,000 | 0.08 | 0.12 | -7.3 |
+| 20,000 | 0.14 | 0.05 | -7.2 |
+| **42,152** | **0.14** | **0.038** | - (마지막 정상) |
+| **42,252** | **NaN** | 0.039 | - (붕괴 시작) |
+| 46,952 | NaN | **1.28** | -10.6 (random) |
+
+### 원인
+
+1. **Entropy 0.04까지 감소** → 정책이 거의 deterministic
+2. **OneHotDist에서 log(극소값) = -inf** → gradient NaN
+3. **Adam optimizer 상태 오염** → 학습 완전 정지
+4. **Policy가 random으로 회귀** (entropy 1.28)
+
+### 적용된 수정 (2026-01-13)
+
+#### 1. OneHotDist.log_prob() 안정화 (`tools.py`)
+```python
+def log_prob(self, value):
+    logprob = super().log_prob(value)
+    return torch.clamp(logprob, min=-20.0)  # -inf 방지
+```
+
+#### 2. Entropy coefficient 증가 (`configs.yaml`)
+```yaml
+actor:
+  entropy: 1e-2  # 1e-3 → 1e-2 (10배 증가)
+```
+
+#### 3. Gradient clipping 강화 (`configs.yaml`)
+```yaml
+actor:
+  grad_clip: 10  # 100 → 10
+```
+
+---
+
+## 14. 📊 학습 메트릭 분석 (Step 0-42,000)
+
+### Return 분포
+
+| Return Range | Count | Percentage |
+|--------------|-------|------------|
+| > -5 (near optimal) | 28 | 1.5% |
+| -6 to -5 | 210 | 11.4% |
+| -8 to -6 | 1,131 | **61.2%** |
+| -10 to -8 | 431 | 23.3% |
+| < -10 | 48 | 2.6% |
+
+**관찰**: 대부분(61%)이 -8 ~ -6 범위에 정체. 더 나은 해로 탈출 못함.
+
+### Phase별 성능
+
+| Phase | Mean Return | Best | Model Loss | Mask Loss |
+|-------|-------------|------|------------|-----------|
+| 0-5k | -21.3 | -5.6 | 14.8 | 8.7 |
+| 5-10k | -7.4 | -4.5 | 7.0 | 2.9 |
+| 10-20k | -7.3 | -4.4 | 4.5 | 1.6 |
+| 20-30k | -7.4 | -4.7 | 4.0 | 1.5 |
+| 30-42k | -7.2 | -4.5 | 4.0 | 1.4 |
+
+**관찰**: 5k step 이후 mean return이 -7.x에서 정체.
+
+### 수렴 속도
+
+| Milestone | First Reached |
+|-----------|---------------|
+| return > -10 | Step 2,532 |
+| return > -8 | Step 3,360 |
+| return > -6 | Step 4,407 |
+| return > -5 | Step 6,152 |
+| return > -4.5 | Step 6,152 |
+
+**Best Return**: -4.36 (Step 15,352)
+
+---
+
+## 15. 🚀 최적화 계획
+
+### 문제 1: Return -7.x 정체
+
+**원인**: 61%가 -8~-6에 갇힘, local optimum에서 탈출 못함
+
+**해결책**:
+- ✅ Entropy 1e-2로 증가 (exploration 유지)
+- 🔲 더 높이 필요시 3e-2까지 시도
+
+### 문제 2: 느린 초기 학습 (5k steps까지)
+
+**원인**: Prefill이 random policy로 수집 (mean -38.5)
+
+**해결책**:
+- 🔲 Prefill 줄이기: 2500 → 1000
+- 🔲 또는 heuristic policy로 prefill
+
+### 문제 3: 낮은 FPS (4.3 steps/sec)
+
+**원인**: 큰 모델 + 단일 환경
+
+**해결책**:
+- 🔲 `envs: 4`로 병렬 환경 증가
+- 🔲 `batch_size: 32`로 증가
+
+### 문제 4: Mask Loss 정체 (1.4-1.6)
+
+**원인**: World model이 방문 상태를 완벽히 학습 못함
+
+**해결책**:
+- 🔲 mask_head loss_scale 증가: 1.0 → 2.0
+- 🔲 또는 coords_loss, current_node_loss 제거
+
+### 우선순위 실험 순서
+
+1. **A**: 현재 수정 (entropy 1e-2, grad_clip 10) 테스트
+2. **B**: envs 4, batch_size 32로 속도 개선
+3. **C**: coords_loss 제거, mask_head loss_scale 2.0
+4. **D**: prefill 1000으로 감소
+
+---
+
+*Last updated: 2026-01-13*

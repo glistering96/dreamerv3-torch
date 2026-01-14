@@ -118,10 +118,10 @@ defaults:
     temp: 0.1
     unimix_ratio: 0.01
     outscale: 1.0
-    entropy: 1e-3
+    entropy: 1e-2
     lr: 3e-4
     eps: 1e-5
-    grad_clip: 100
+    grad_clip: 10
   critic:
     layers: 2
     dist: symlog_disc
